@@ -543,7 +543,11 @@ public class DbusManagerImpl implements Manager {
     }
 
     @Override
-    public SendMessageResults sendStory(String attachment, boolean allowsReplies) {
+    public SendMessageResults sendStory(
+            String attachment,
+            boolean allowsReplies,
+            Optional<GroupId> groupId
+    ) {
         throw new UnsupportedOperationException();
     }
 

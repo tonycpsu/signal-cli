@@ -350,7 +350,11 @@ class SseInitialFlushTest {
         }
 
         @Override
-        public SendMessageResults sendStory(String attachment, boolean allowsReplies) {
+        public SendMessageResults sendStory(
+                String attachment,
+                boolean allowsReplies,
+                Optional<GroupId> groupId
+        ) {
             return new SendMessageResults(0, Map.of());
         }
 
