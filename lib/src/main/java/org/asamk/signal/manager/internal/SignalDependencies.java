@@ -101,6 +101,7 @@ public class SignalDependencies {
     private SignalServiceMessageSender messageSender;
 
     private List<SecureValueRecovery> secureValueRecovery;
+    private CertificateValidator certificateValidator;
 
     SignalDependencies(
             final ServiceEnvironmentConfig serviceEnvironmentConfig,
@@ -398,7 +399,9 @@ public class SignalDependencies {
     }
 
     public SignalServiceCipher getCipher(ServiceIdType serviceIdType) {
-        final var certificateValidator = new CertificateValidator(serviceEnvironmentConfig.unidentifiedSenderTrustRoots());
+        final var validator = getOrCreate(() -> certificateValidator,
+                () -> certificateValidator = new CertificateValidator(
+                        serviceEnvironmentConfig.unidentifiedSenderTrustRoots()));
         final var serviceId = serviceIdType == ServiceIdType.ACI
                 ? credentialsProvider.getAci()
                 : credentialsProvider.getPni();
@@ -408,7 +411,7 @@ public class SignalDependencies {
                 deviceId,
                 serviceIdType == ServiceIdType.ACI ? dataStore.aci() : dataStore.pni(),
                 sessionLock,
-                certificateValidator);
+                validator);
     }
 
     private <T> T getOrCreate(Supplier<T> supplier, Callable creator) {
