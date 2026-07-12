@@ -4,14 +4,11 @@ on:
   push:
     tags:
       - v*
+  workflow_dispatch:
 
 permissions: {}
 
 env:
-  IMAGE_NAME: signal-cli
-  IMAGE_REGISTRY: ghcr.io/asamk
-  REGISTRY_USER: ${{ github.actor }}
-  REGISTRY_PASSWORD: ${{ github.token }}
   ARCHIVE_JAVA_VERSION: 25
 
 jobs:
@@ -23,8 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Download signal-cli build from CI workflow
         uses: actions/download-artifact@v8
@@ -41,9 +36,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v${{ steps.version.outputs.version }} # note: added `v`
-          release_name: v${{ steps.version.outputs.version }} # note: added `v`
-          draft: true
+          tag_name: v${{ steps.version.outputs.version }}
+          release_name: v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: true
 
       - name: Upload archive
         uses: actions/upload-release-asset@v1
@@ -53,7 +49,7 @@ jobs:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: signal-cli-${{ steps.version.outputs.version }}.tar.gz
           asset_name: signal-cli-${{ steps.version.outputs.version }}.tar.gz
-          asset_content_type: application/x-compressed-tar # .tar.gz
+          asset_content_type: application/x-compressed-tar
 
       - name: Upload Linux native archive
         uses: actions/upload-release-asset@v1
@@ -63,7 +59,7 @@ jobs:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: signal-cli-${{ steps.version.outputs.version }}-Linux-native.tar.gz
           asset_name: signal-cli-${{ steps.version.outputs.version }}-Linux-native.tar.gz
-          asset_content_type: application/x-compressed-tar # .tar.gz
+          asset_content_type: application/x-compressed-tar
 
       - name: Upload Linux client archive
         uses: actions/upload-release-asset@v1
@@ -73,136 +69,4 @@ jobs:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: signal-cli-${{ steps.version.outputs.version }}-Linux-client.tar.gz
           asset_name: signal-cli-${{ steps.version.outputs.version }}-Linux-client.tar.gz
-          asset_content_type: application/x-compressed-tar # .tar.gz
-
-      - name: Upload JSON schemas archive
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: signal-cli-${{ steps.version.outputs.version }}-json-schemas.tar.gz
-          asset_name: signal-cli-${{ steps.version.outputs.version }}-json-schemas.tar.gz
-          asset_content_type: application/x-compressed-tar # .tar.gz
-
-  build-container:
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v6
-      - name: Download signal-cli build from CI workflow
-        uses: actions/download-artifact@v8
-
-      - name: Move archive file
-        run: |
-          tar xf signal-cli-archive-${{ env.ARCHIVE_JAVA_VERSION }}/signal-cli-${{ needs.release.outputs.version }}.tar.gz
-          mkdir -p build/install/
-          mv ./signal-cli-"${{ needs.release.outputs.version }}"/ build/install/signal-cli
-
-      - name: Build Image
-        id: build_image
-        uses: redhat-actions/buildah-build@v2
-        with:
-          image: ${{ env.IMAGE_NAME }}
-          tags: latest ${{ github.sha }} ${{ needs.release.outputs.version }}
-          containerfiles: ./Containerfile
-          oci: true
-
-      - name: Push To GHCR
-        uses: redhat-actions/push-to-registry@v2
-        id: push
-        with:
-          image: ${{ steps.build_image.outputs.image }}
-          tags: ${{ steps.build_image.outputs.tags }}
-          registry: ${{ env.IMAGE_REGISTRY }}
-          username: ${{ env.REGISTRY_USER }}
-          password: ${{ env.REGISTRY_PASSWORD }}
-
-      - name: Echo outputs
-        run: |
-          echo "${{ toJSON(steps.push.outputs) }}"
-
-  build-container-native:
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v6
-      - name: Download signal-cli build from CI workflow
-        uses: actions/download-artifact@v8
-
-      - name: Move archive file
-        run: |
-          tar xf signal-cli-archive-${{ env.ARCHIVE_JAVA_VERSION }}/signal-cli-${{ needs.release.outputs.version }}-Linux-native.tar.gz
-          mkdir -p build/native/nativeCompile/
-          mv signal-cli build/native/nativeCompile/
-          chmod +x build/native/nativeCompile/signal-cli
-
-      - name: Build Image
-        id: build_image
-        uses: redhat-actions/buildah-build@v2
-        with:
-          image: ${{ env.IMAGE_NAME }}
-          tags: latest-native ${{ github.sha }}-native ${{ needs.release.outputs.version }}-native
-          containerfiles: ./native.Containerfile
-          oci: true
-
-      - name: Push To GHCR
-        uses: redhat-actions/push-to-registry@v2
-        id: push
-        with:
-          image: ${{ steps.build_image.outputs.image }}
-          tags: ${{ steps.build_image.outputs.tags }}
-          registry: ${{ env.IMAGE_REGISTRY }}
-          username: ${{ env.REGISTRY_USER }}
-          password: ${{ env.REGISTRY_PASSWORD }}
-
-      - name: Echo outputs
-        run: |
-          echo "${{ toJSON(steps.push.outputs) }}"
-
-  build-container-client:
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v6
-      - name: Download signal-cli build from CI workflow
-        uses: actions/download-artifact@v8
-
-      - name: Move archive file
-        run: |
-          tar xf signal-cli-archive-${{ env.ARCHIVE_JAVA_VERSION }}/signal-cli-${{ needs.release.outputs.version }}-Linux-client.tar.gz
-          mkdir -p client/target/release/
-          mv signal-cli-client client/target/release/
-          chmod +x client/target/release/signal-cli-client
-
-      - name: Build Image
-        id: build_image
-        uses: redhat-actions/buildah-build@v2
-        with:
-          image: ${{ env.IMAGE_NAME }}
-          tags: latest-client ${{ github.sha }}-client ${{ needs.release.outputs.version }}-client
-          containerfiles: ./client.Containerfile
-          oci: true
-
-      - name: Push To GHCR
-        uses: redhat-actions/push-to-registry@v2
-        id: push
-        with:
-          image: ${{ steps.build_image.outputs.image }}
-          tags: ${{ steps.build_image.outputs.tags }}
-          registry: ${{ env.IMAGE_REGISTRY }}
-          username: ${{ env.REGISTRY_USER }}
-          password: ${{ env.REGISTRY_PASSWORD }}
-
-      - name: Echo outputs
-        run: |
-          echo "${{ toJSON(steps.push.outputs) }}"
+          asset_content_type: application/x-compressed-tar
