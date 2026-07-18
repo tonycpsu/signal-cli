@@ -60,6 +60,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
@@ -69,6 +70,16 @@ import okio.ByteString;
 public class SendHelper {
 
     private static final Logger logger = LoggerFactory.getLogger(SendHelper.class);
+
+    /**
+     * Recipient count at or above which a group send is logged on entry. Sends at this size are
+     * the ones observed to overflow the stack, and the log is what tells a later reader whether
+     * the overflow handler ran at all or was bypassed by the runtime's fatal-error path.
+     */
+    private static final int LARGE_GROUP_SEND_LOG_THRESHOLD = 100;
+
+    /** Distribution ids whose stack-overflow diagnostics have already been logged this process. */
+    private static final Set<String> stackOverflowReported = ConcurrentHashMap.newKeySet();
 
     private final SignalAccount account;
     private final SignalDependencies dependencies;
@@ -675,7 +686,8 @@ public class SendHelper {
             final List<SendMessageResult> results = sendGroupMessageInternalWithLegacy(legacySender,
                     addresses,
                     sealedSenderAccesses,
-                    isRecipientUpdate || !allResults.isEmpty());
+                    isRecipientUpdate || !allResults.isEmpty(),
+                    "group=" + groupInfo.getGroupId().toBase64());
             allResults.addAll(results);
         }
         allResults.addAll(skippedResults);
@@ -733,8 +745,15 @@ public class SendHelper {
             final LegacySenderHandler sender,
             final List<SignalServiceAddress> addresses,
             final List<SealedSenderAccess> unidentifiedAccesses,
-            final boolean isRecipientUpdate
+            final boolean isRecipientUpdate,
+            final String diagnosticKey
     ) throws IOException {
+        if (addresses.size() >= LARGE_GROUP_SEND_LOG_THRESHOLD) {
+            // Same purpose as the entry log on the sender-key path: a group with no endorsements
+            // sends its whole roster this way, so a legacy send can be just as large, and without
+            // this line a fatal-error-path death here leaves nothing to correlate against.
+            logger.info("Starting legacy 1:1 group send to {} recipients ({}).", addresses.size(), diagnosticKey);
+        }
         try {
             final var results = sender.send(addresses, unidentifiedAccesses, isRecipientUpdate);
 
@@ -743,6 +762,28 @@ public class SendHelper {
             return results;
         } catch (org.whispersystems.signalservice.api.crypto.UntrustedIdentityException | NoSessionException e) {
             return List.of();
+        } catch (StackOverflowError e) {
+            // The legacy path is NOT known to be immune to the overflow that motivated the guard
+            // in the sender-key path above. It is often described as "per-recipient, so small N",
+            // but that is not true at this boundary: `addresses` here is the full legacy target
+            // list, which for a large group is hundreds of entries. Whether the layer below fans
+            // that out one recipient at a time is an implementation detail of code that has not
+            // been cleared, so treat immunity as an assumption, not a finding.
+            //
+            // Without this catch an overflow here propagates uncaught and the daemon exits 99 and
+            // crash-loops, which is the exact failure the sender-key guard exists to prevent. Same
+            // reasoning as there: disposition is unknown, so surface it rather than retry.
+            logStackOverflow(e, "legacy 1:1", addresses.size(), diagnosticKey);
+            // Diagnostics were extracted above, so drop the frames from the cause before chaining
+            // it. Otherwise the StackOverflowError rides the IOException up to the JSON-RPC and
+            // HTTP error handlers, which log the whole cause chain unconditionally -- on every
+            // occurrence and every application-level retry -- re-dumping thousands of frames and
+            // defeating the bounded, once-per-group logging this method just performed. The
+            // cause's type and message still reach those logs, which is the identifying part.
+            e.setStackTrace(new StackTraceElement[0]);
+            throw new IOException(("legacy 1:1 group send to %d recipients overflowed the stack; "
+                    + "aborting rather than retrying, because disposition is unknown").formatted(addresses.size()),
+                    e);
         }
     }
 
@@ -765,6 +806,15 @@ public class SendHelper {
                     keyAge,
                     TimeUnit.MILLISECONDS.toDays(keyAge));
             account.getSenderKeyStore().deleteOurKey(account.getAci(), distributionId);
+        }
+
+        if (addresses.size() >= LARGE_GROUP_SEND_LOG_THRESHOLD) {
+            // Large sends are the ones that overflow. Logging entry makes the absence of a
+            // completion or overflow log meaningful: it is how you tell "the StackOverflowError
+            // handler never ran" (runtime took the fatal-error path) from "no crash occurred".
+            logger.info("Starting sender-key group send to {} recipients (distributionId {}).",
+                    addresses.size(),
+                    distributionId);
         }
 
         try {
@@ -806,7 +856,108 @@ public class SendHelper {
             } else {
                 throw e;
             }
+        } catch (StackOverflowError e) {
+            // A sender-key group send to a large recipient set can blow the stack. Observed in
+            // production: every send at >=262 recipients (4 of 4) died within a second, while none of 26
+            // sends at <=125 recipients did. Left uncaught, the GraalVM native image reports it
+            // through its fatal-error handler -- three StackOverflowCheckImpl frames plus a
+            // register/heap dump, no application frames -- and the daemon exits 99 and
+            // crash-loops, re-driving the same send while the group keeps growing.
+            //
+            // Two caveats on what this catch can actually achieve, both unproven:
+            //
+            //  - It may never run. The production evidence IS a fatal-error-handler report, which
+            //    is what you see when the overflow could not be delivered as a catchable Java
+            //    throwable (yellow zone already consumed, or an overflow inside native/JNI code --
+            //    and the recursion is only reachable behind the network call, which is exactly
+            //    where libsignal's native code sits). If so this is inert. The entry log above is
+            //    what distinguishes "the catch never fired" from "no crash happened".
+            //
+            //  - It cannot report the recursion's depth, so it cannot tell you whether the
+            //    recursion is linear in the recipient count or worse. See StackOverflowDiagnostics.
+            //
+            // What it does NOT do is fall back to legacy 1:1 sends, and that is deliberate. A
+            // StackOverflowError gives no guarantee about how far the send got: the sibling
+            // catches above appear to cover conditions where the server rejected the send or it
+            // never left -- that is the apparent intent behind upstream choosing to fall back for
+            // them, not something verified here -- whereas this can strike after the
+            // multi-recipient POST was accepted, while parsing the response. Falling back would
+            // then re-deliver the identical message to every recipient, and there is no
+            // send-side dedupe to stop it (the message-send log serves the retry-resend service,
+            // not idempotency). Returning null or failure results both route these targets into
+            // the legacy fan-out via the caller, so aborting the whole send is the only way not
+            // to re-send from here.
+            //
+            // The trade is deliberate but not free, and it is UNVERIFIED in both directions.
+            // Signal receivers are believed to discard repeats of the same (sender, timestamp) --
+            // the retry-resend mechanism depends on re-receipt being tolerable -- which would make
+            // the duplicate risk smaller than the plain reading suggests. Against that, the cost
+            // of aborting is certain: the whole send fails, including legacy-only recipients who
+            // were never at risk of duplication. Nobody has confirmed receiver behaviour. Aborting
+            // is the conservative choice while disposition is unknown; revisit it if that dedupe
+            // is ever established.
+            //
+            // Catching an Error is deliberate: the stack has unwound by the time this runs, so the
+            // logging below has room to work.
+            //
+            // Paired with a deployment-side change in the consuming repo, which raises -Xss from
+            // 16m to 64m in backend/scripts/start-signal-cli.sh. Separate repos, shipped together,
+            // individually reversible -- so don't assume one implies the other is present.
+            logStackOverflow(e, "sender-key", addresses.size(), "distributionId=" + distributionId);
+            // Diagnostics were extracted above, so drop the frames from the cause before chaining
+            // it. Otherwise the StackOverflowError rides the IOException up to the JSON-RPC and
+            // HTTP error handlers, which log the whole cause chain unconditionally -- on every
+            // occurrence and every application-level retry -- re-dumping thousands of frames and
+            // defeating the bounded, once-per-group logging this method just performed. The
+            // cause's type and message still reach those logs, which is the identifying part.
+            e.setStackTrace(new StackTraceElement[0]);
+            throw new IOException(("sender-key group send to %d recipients overflowed the stack; "
+                    + "aborting rather than falling back, because the message may already have been "
+                    + "delivered and a fallback would re-send it to every recipient").formatted(addresses.size()),
+                    e);
         }
+    }
+
+    /**
+     * Log a bounded description of a stack overflow during a group send.
+     * <p>
+     * Emitted at most once per distribution id per process: the crash used to bound its own
+     * repetition by killing the daemon, and now that it does not, an application-level retry of
+     * the same send would otherwise re-emit the whole block every time.
+     */
+    private void logStackOverflow(
+            final StackOverflowError error,
+            final String path,
+            final int recipientCount,
+            final String diagnosticKey
+    ) {
+        if (!stackOverflowReported.add(diagnosticKey)) {
+            logger.error("StackOverflowError in {} group send to {} recipients ({}); "
+                    + "diagnostics already logged for this group, not repeating them.",
+                    path,
+                    recipientCount,
+                    diagnosticKey);
+            return;
+        }
+        final var frames = error.getStackTrace();
+        final var cycleLength = StackOverflowDiagnostics.findRepeatingCycleLength(frames);
+        // The recorded frame count is a LOWER BOUND, never "the depth". HotSpot caps
+        // getStackTrace() at MaxJavaStackTraceDepth (1024 by default); this binary is a native
+        // image, which rejects that flag because it does not implement -XX options at all -- so
+        // the cap that applies here is simply unverified. Either way the count can be far below
+        // the real depth, and reporting it as the depth would invite the wrong conclusion about
+        // whether the recursion scales linearly with the recipient count. That question has to be
+        // answered elsewhere, from how the failure threshold moves with -Xss.
+        logger.error("StackOverflowError in {} group send: {} recipients, {}, {} frames recorded{}.",
+                path,
+                recipientCount,
+                diagnosticKey,
+                frames.length,
+                StackOverflowDiagnostics.looksTruncated(frames, cycleLength)
+                        ? " (TRUNCATED -- periodicity runs to the deepest recorded frame, so the real depth is"
+                        + " larger, possibly far larger; treat this as a lower bound)"
+                        : " (appears complete -- the trace reaches a non-recursive frame)");
+        StackOverflowDiagnostics.describe(frames).forEach(line -> logger.error("  {}", line));
     }
 
     private SendMessageResult sendMessage(
