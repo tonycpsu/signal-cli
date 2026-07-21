@@ -17,6 +17,7 @@ import org.asamk.signal.json.JsonReceiveMessageHandler;
 import org.asamk.signal.jsonrpc.SocketHandler;
 import org.asamk.signal.manager.Manager;
 import org.asamk.signal.manager.MultiAccountManager;
+import org.asamk.signal.manager.helper.StackOverflowReporter;
 import org.asamk.signal.output.JsonWriter;
 import org.asamk.signal.output.OutputWriter;
 import org.asamk.signal.output.PlainTextWriter;
@@ -105,6 +106,7 @@ public class DaemonCommand implements MultiLocalCommand, LocalCommand {
             final OutputWriter outputWriter
     ) throws CommandException {
         Shutdown.installHandler();
+        installStackOverflowDiagnosticHandler();
         logger.info("Starting daemon in single-account mode for {}", m.getSelfNumber());
         final var noReceiveStdOut = Boolean.TRUE.equals(ns.getBoolean("no-receive-stdout"));
         final var receiveMode = ns.<ReceiveMode>get("receive-mode");
@@ -132,6 +134,7 @@ public class DaemonCommand implements MultiLocalCommand, LocalCommand {
             final OutputWriter outputWriter
     ) throws CommandException {
         Shutdown.installHandler();
+        installStackOverflowDiagnosticHandler();
         logger.info("Starting daemon in multi-account mode");
         final var noReceiveStdOut = Boolean.TRUE.equals(ns.getBoolean("no-receive-stdout"));
         final var receiveMode = ns.<ReceiveMode>get("receive-mode");
@@ -155,6 +158,45 @@ public class DaemonCommand implements MultiLocalCommand, LocalCommand {
                 }
             }
         }
+    }
+
+    /**
+     * Install a process-global uncaught-exception handler that logs the recursion cycle whenever a
+     * StackOverflowError kills any thread.
+     * <p>
+     * leakfix2 (a8c9ce39) caught the overflow at two SendHelper group-send call sites, but
+     * production keeps crashing because the overflow also fires on the background {@code [receive-N]}
+     * / {@code RxCachedThreadScheduler-*} threads during recipient resolution, where those catches
+     * never run. This is the belt to the receive/Rx guard's suspenders: it catches an overflow on
+     * <em>any</em> thread and code path, not just the send sites.
+     * <p>
+     * Diagnostic only. It logs via {@link StackOverflowReporter} and then hands the throwable to the
+     * previously-installed default handler (or reproduces the JVM default of printing it) so the
+     * thread dies exactly as before -- it does not swallow the error or exit the process, preserving
+     * the rc=99 self-heal the ops wrapper relies on.
+     * <p>
+     * Caveat (why the receive/Rx guard also exists): a GraalVM native image may route a
+     * StackOverflowError to its own fatal-error handler <em>without</em> invoking this Java handler
+     * at all -- exactly the {@code rc=99}, three-{@code StackOverflowCheckImpl}-frames crash seen in
+     * production. This handler cannot be assumed to fire in the native image; it is one of two
+     * complementary catches for that reason.
+     */
+    private static void installStackOverflowDiagnosticHandler() {
+        final var existing = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            try {
+                StackOverflowReporter.reportIfStackOverflow(throwable, "uncaught on " + thread.getName());
+            } catch (Throwable ignored) {
+                // Diagnostics must never interfere with the crash path.
+            }
+            if (existing != null) {
+                existing.uncaughtException(thread, throwable);
+            } else {
+                // Reproduce the JVM's default: print and let the thread die. Do NOT swallow.
+                System.err.print("Exception in thread \"" + thread.getName() + "\" ");
+                throwable.printStackTrace(System.err);
+            }
+        });
     }
 
     private static void setup(final Namespace ns, final DaemonHandler daemonHandler) throws CommandException {
