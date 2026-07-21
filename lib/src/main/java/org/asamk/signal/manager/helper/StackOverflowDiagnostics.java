@@ -15,12 +15,15 @@ import java.util.List;
  * recorded frame count may be capped by the runtime, so it is only ever a lower bound and cannot
  * tell you whether the recursion grows linearly with the input size or faster.
  * <p>
- * Kept separate from {@link SendHelper} with package-private statics purely so it can be unit
- * tested: every method here is pure, and the interesting cases (a periodic prefix above
- * non-periodic frames, a trace cut mid-recursion, degenerate short traces) are easy to get wrong
- * and hard to reproduce from a real overflow.
+ * Kept separate from {@link SendHelper} so it can be unit tested: every method here is pure, and
+ * the interesting cases (a periodic prefix above non-periodic frames, a trace cut mid-recursion,
+ * degenerate short traces) are easy to get wrong and hard to reproduce from a real overflow.
+ * <p>
+ * {@link #describe} is public so the global uncaught-exception handler and the receive/Rx dispatch
+ * guard (both outside this package) can render the same bounded summary the send-side guards do.
+ * The remaining statics stay package-private -- they exist only for the same-package unit test.
  */
-final class StackOverflowDiagnostics {
+public final class StackOverflowDiagnostics {
 
     /**
      * How far down to look when searching for the period. Bounded for cost: the search is
@@ -135,7 +138,7 @@ final class StackOverflowDiagnostics {
      * for long traces, a window of the deepest ones. Returned as lines so the caller decides the
      * log level and the test can assert on content.
      */
-    static List<String> describe(final StackTraceElement[] frames) {
+    public static List<String> describe(final StackTraceElement[] frames) {
         final var lines = new ArrayList<String>();
         if (frames == null || frames.length == 0) {
             lines.add("no stack frames were recorded by the runtime");

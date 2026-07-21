@@ -5,6 +5,7 @@ import org.asamk.signal.manager.api.Pair;
 import org.asamk.signal.manager.api.PhoneNumberSharingMode;
 import org.asamk.signal.manager.api.Profile;
 import org.asamk.signal.manager.api.UnregisteredRecipientException;
+import org.asamk.signal.manager.helper.StackOverflowReporter;
 import org.asamk.signal.manager.storage.Database;
 import org.asamk.signal.manager.storage.Utils;
 import org.asamk.signal.manager.storage.contacts.ContactsStore;
@@ -1031,6 +1032,25 @@ public class RecipientStore implements RecipientIdCreator, RecipientResolver, Re
             connection.commit();
         } catch (SQLException e) {
             throw new RuntimeException("Failed update recipient store", e);
+        } catch (StackOverflowError e) {
+            // leakfix3: this is the receive/Rx chokepoint the global handler backstops. The
+            // profile-resolution mutual recursion (ProfileHelper.getRecipientProfile ->
+            // getUnidentifiedAccess -> getRecipientProfile) drives one markRegistered(true) per
+            // level from its doOnSuccess, so this method is the convergence frame both the
+            // [receive-N] blockingGet path and the RxCachedThreadScheduler (Schedulers.io) merge
+            // path pass through -- and the exact frame emitting the "Marking ... as registered=true"
+            // log seen looping right before the crash. Log the recursion cycle once (the reporter
+            // de-dupes so the rethrow into the global handler does not describe it twice), then
+            // rethrow unchanged: diagnostic only, no behaviour change, the process still dies as it
+            // does today. The report call is itself guarded so nothing it does (the cause-chain
+            // walk / de-dup slot read) can mask the error or skip the rethrow below -- mirroring the
+            // global handler's guard; the load-bearing line is `throw e`, which must always run.
+            try {
+                StackOverflowReporter.reportIfStackOverflow(e, "receive/Rx recipient registration-marking");
+            } catch (Throwable ignored) {
+                // Diagnostics must never interfere with the crash path.
+            }
+            throw e;
         }
     }
 
