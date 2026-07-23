@@ -10,7 +10,7 @@ plugins {
 
 allprojects {
     group = "org.asamk"
-    version = "0.14.5-leakfix3"
+    version = "0.14.5-leakfix4"
 }
 
 java {
