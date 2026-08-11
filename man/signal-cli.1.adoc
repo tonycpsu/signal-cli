@@ -410,6 +410,13 @@ Clear session state and send end session message.
 *--edit-timestamp*::
 Specify the timestamp of a previous message with the recipient or group to send an edited message.
 
+*--timestamp*::
+Specify the message timestamp (its Signal message id).
+Reusing the timestamp of a previous send makes the message a duplicate that recipients discard.
+This allows idempotent retries: if a send times out, the caller can retry with the same timestamp and recipients will deduplicate.
+Must be a positive number not in the future.
+Defaults to the current time.
+
 *--no-urgent*::
 Send the message without the urgent flag, so no push notification is triggered for the recipient.
 The message will still be delivered in real-time if the recipient's app is active.
