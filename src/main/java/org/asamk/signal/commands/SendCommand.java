@@ -109,6 +109,13 @@ public class SendCommand implements JsonRpcLocalCommand {
                 .action(Arguments.storeTrue())
                 .help("Send the message without the urgent flag, so no push notification is triggered for the recipient. "
                         + "The message will still be delivered in real-time if the recipient's app is active.");
+        subparser.addArgument("--timestamp")
+                .type(long.class)
+                .help("Specify the message timestamp (its Signal message id). "
+                        + "Reusing the timestamp of a previous send makes the message a duplicate that recipients discard. "
+                        + "Must be a positive number in the past. "
+                        + "Cannot be combined with --edit-timestamp or --end-session. "
+                        + "Defaults to the current time.");
         subparser.addArgument("--voice-note")
                 .action(Arguments.storeTrue())
                 .help("Mark audio attachments as voice notes. Voice notes are displayed inline in Signal clients.");
@@ -133,8 +140,19 @@ public class SendCommand implements JsonRpcLocalCommand {
                 groupIdStrings,
                 usernameStrings);
 
+        final var messageTimestamp = parseMessageTimestamp(ns.get("timestamp"), System.currentTimeMillis());
+
+        final var editTimestamp = ns.getLong("edit-timestamp");
+        if (editTimestamp != null && messageTimestamp.isPresent()) {
+            throw new UserErrorException("--timestamp cannot be combined with --edit-timestamp");
+        }
+
         final var isEndSession = Boolean.TRUE.equals(ns.getBoolean("end-session"));
         if (isEndSession) {
+            if (messageTimestamp.isPresent()) {
+                throw new UserErrorException("--timestamp cannot be combined with --end-session");
+            }
+
             final var singleRecipients = recipientIdentifiers.stream()
                     .filter(r -> r instanceof RecipientIdentifier.Single)
                     .map(RecipientIdentifier.Single.class::cast)
@@ -244,8 +262,6 @@ public class SendCommand implements JsonRpcLocalCommand {
                     "Sending empty message is not allowed, either a message, attachment or sticker must be given.");
         }
 
-        final var editTimestamp = ns.getLong("edit-timestamp");
-
         try {
             final var message = new Message(messageText,
                     attachments,
@@ -257,7 +273,8 @@ public class SendCommand implements JsonRpcLocalCommand {
                     previews,
                     Optional.ofNullable((storyReply)),
                     textStyles,
-                    !noUrgent);
+                    !noUrgent,
+                    messageTimestamp);
             var results = editTimestamp != null
                     ? m.sendEditMessage(message, recipientIdentifiers, editTimestamp)
                     : m.sendMessage(message, recipientIdentifiers, notifySelf);
@@ -278,6 +295,24 @@ public class SendCommand implements JsonRpcLocalCommand {
         } catch (InvalidStickerException e) {
             throw new UserErrorException("Failed to send sticker: " + e.getMessage(), e);
         }
+    }
+
+    static Optional<Long> parseMessageTimestamp(final Object raw, final long now) throws UserErrorException {
+        if (raw == null) {
+            return Optional.empty();
+        }
+        final long ts = switch (raw) {
+            case Integer i -> i.longValue();
+            case Long l -> l;
+            default -> throw new UserErrorException("Timestamp must be an integer number of milliseconds");
+        };
+        if (ts <= 0) {
+            throw new UserErrorException("Timestamp must be positive");
+        }
+        if (ts >= now) {
+            throw new UserErrorException("Timestamp must be in the past");
+        }
+        return Optional.of(ts);
     }
 
     private List<Message.Mention> parseMentions(

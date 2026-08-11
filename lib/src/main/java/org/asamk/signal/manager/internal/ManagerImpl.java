@@ -151,6 +151,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -667,6 +668,15 @@ public class ManagerImpl implements Manager {
         return context.getGroupHelper().joinGroup(inviteLinkUrl);
     }
 
+    /**
+     * Selects the timestamp to use for an outgoing message: the caller-supplied
+     * timestamp if present, otherwise a freshly minted one from {@code minter}.
+     * The minter is only invoked when {@code supplied} is empty.
+     */
+    static long selectMessageTimestamp(Optional<Long> supplied, LongSupplier minter) {
+        return supplied.orElseGet(minter::getAsLong);
+    }
+
     private long getNextMessageTimestamp() {
         while (true) {
             final var last = lastMessageTimestamp.get();
@@ -690,7 +700,7 @@ public class ManagerImpl implements Manager {
             Set<RecipientIdentifier> recipients,
             boolean notifySelf
     ) throws IOException, NotAGroupMemberException, GroupNotFoundException, GroupSendingNotAllowedException {
-        return sendMessage(messageBuilder, recipients, notifySelf, Optional.empty(), true);
+        return sendMessage(messageBuilder, recipients, notifySelf, Optional.empty(), Optional.empty(), true);
     }
 
     private SendMessageResults sendMessage(
@@ -698,10 +708,11 @@ public class ManagerImpl implements Manager {
             Set<RecipientIdentifier> recipients,
             boolean notifySelf,
             Optional<Long> editTargetTimestamp,
+            Optional<Long> messageTimestamp,
             boolean urgent
     ) throws IOException, NotAGroupMemberException, GroupNotFoundException, GroupSendingNotAllowedException {
         var results = new HashMap<RecipientIdentifier, List<SendMessageResult>>();
-        long timestamp = getNextMessageTimestamp();
+        long timestamp = selectMessageTimestamp(messageTimestamp, this::getNextMessageTimestamp);
         messageBuilder.withTimestamp(timestamp);
         for (final var recipient : recipients) {
             if (recipient instanceof RecipientIdentifier.NoteToSelf || (
@@ -834,7 +845,7 @@ public class ManagerImpl implements Manager {
         }
         final var messageBuilder = SignalServiceDataMessage.newBuilder();
         applyMessage(messageBuilder, message);
-        return sendMessage(messageBuilder, recipients, notifySelf, Optional.empty(), message.urgent());
+        return sendMessage(messageBuilder, recipients, notifySelf, Optional.empty(), message.timestamp(), message.urgent());
     }
 
     @Override
@@ -845,7 +856,7 @@ public class ManagerImpl implements Manager {
     ) throws IOException, AttachmentInvalidException, NotAGroupMemberException, GroupNotFoundException, GroupSendingNotAllowedException, UnregisteredRecipientException, InvalidStickerException {
         final var messageBuilder = SignalServiceDataMessage.newBuilder();
         applyMessage(messageBuilder, message);
-        return sendMessage(messageBuilder, recipients, false, Optional.of(editTargetTimestamp), message.urgent());
+        return sendMessage(messageBuilder, recipients, false, Optional.of(editTargetTimestamp), Optional.empty(), message.urgent());
     }
 
     @Override
