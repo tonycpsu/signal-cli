@@ -266,6 +266,10 @@ public class SendCommand implements JsonRpcLocalCommand {
             messageTimestamp = Optional.empty();
         }
 
+        if (editTimestamp != null && messageTimestamp.isPresent()) {
+            throw new UserErrorException("--timestamp cannot be combined with --edit-timestamp");
+        }
+
         try {
             final var message = new Message(messageText,
                     attachments,

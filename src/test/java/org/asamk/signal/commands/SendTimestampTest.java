@@ -153,7 +153,7 @@ class SendTimestampTest {
     // --- Test 8: Small integer over JSON-RPC yields clean handling, not ClassCastException ---
 
     @Test
-    void smallIntegerTimestampYieldsUserError() {
+    void smallIntegerTimestampIsHandledCleanly() throws CommandException {
         var captured = new AtomicReference<Message>();
         var manager = capturingManager(captured);
 
@@ -164,15 +164,8 @@ class SendTimestampTest {
                 "timestamp", 12345
         ));
 
-        // 12345 is a valid positive past timestamp, so it should pass validation
-        // and be threaded through as Optional.of(12345L)
-        try {
-            new SendCommand().handleCommand(ns, manager, nullWriter());
-            assertEquals(Optional.of(12345L), captured.get().timestamp());
-        } catch (CommandException e) {
-            // Also acceptable if treated as a clean user error
-            assertTrue(e instanceof UserErrorException, "Should be UserErrorException, not ClassCastException");
-        }
+        new SendCommand().handleCommand(ns, manager, nullWriter());
+        assertEquals(Optional.of(12345L), captured.get().timestamp());
     }
 
     @Test
@@ -197,5 +190,24 @@ class SendTimestampTest {
         } catch (CommandException e) {
             throw new AssertionError("Unexpected exception: " + e, e);
         }
+    }
+
+    // --- Test 9: --timestamp combined with --edit-timestamp is rejected ---
+
+    @Test
+    void timestampWithEditTimestampIsRejected() {
+        var captured = new AtomicReference<Message>();
+        var manager = capturingManager(captured);
+
+        var ns = jsonRpcNamespace(Map.of(
+                "recipient", "+11234567890",
+                "message", "hello",
+                "timestamp", System.currentTimeMillis() - 5000,
+                "editTimestamp", System.currentTimeMillis() - 10000
+        ));
+
+        var ex = assertThrows(UserErrorException.class,
+                () -> new SendCommand().handleCommand(ns, manager, nullWriter()));
+        assertTrue(ex.getMessage().contains("--edit-timestamp"));
     }
 }
