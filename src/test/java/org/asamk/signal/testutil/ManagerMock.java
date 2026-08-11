@@ -2,6 +2,7 @@ package org.asamk.signal.testutil;
 
 import org.asamk.signal.manager.Manager;
 
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -34,10 +35,27 @@ public final class ManagerMock {
     }
 
     public static Manager create(final String selfNumber, final State state) {
+        return create(selfNumber, state, Map.of());
+    }
+
+    /**
+     * Like {@link #create(String, State)}, but allows overriding the behavior of
+     * specific methods by name. Overrides are checked before the built-in switch,
+     * so they take precedence over the default mock behavior.
+     */
+    public static Manager create(
+            final String selfNumber,
+            final State state,
+            final Map<String, InvocationHandler> overrides
+    ) {
         return (Manager) Proxy.newProxyInstance(Manager.class.getClassLoader(),
                 new Class<?>[]{Manager.class},
                 (proxy, method, args) -> {
                     final var methodName = method.getName();
+                    final var override = overrides.get(methodName);
+                    if (override != null) {
+                        return override.invoke(proxy, method, args);
+                    }
                     switch (methodName) {
                         case "getSelfNumber":
                             return selfNumber;
