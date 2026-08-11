@@ -28,6 +28,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * past-only bound (including the same-millisecond edge case), mutual
  * exclusion with {@code --edit-timestamp} and {@code --end-session}, and
  * strict JSON-RPC numeric type checking (spec tests 1-4, 8-9).
+ * <p>
+ * The parsing/validation logic itself (spec tests 3, 3b, 4, 4b, 8, 8b-8d) is
+ * covered deterministically against
+ * {@link SendCommand#parseMessageTimestamp(Object, long)} directly, since it
+ * takes the clock as a parameter and needs no Manager mock or wall-clock
+ * sampling. The tests here that go through {@link SendCommand#handleCommand}
+ * instead verify the wiring: that the parsed value is threaded through to the
+ * outgoing message (or omitted), and that the mutual-exclusion checks fire.
+ * <p>
  * Spec test 5 ({@code lastMessageTimestamp} left untouched by the supplied
  * path) and tests 6-7 (compose with quote, group sends) need a real Manager
  * and are not covered here; test 5's actual selection logic
@@ -68,6 +77,73 @@ class SendTimestampTest {
         return new PlainTextWriterImpl(new StringWriter());
     }
 
+    // --- parseMessageTimestamp: deterministic boundary and type tests ---
+
+    @Test
+    void parseMessageTimestampRejectsTimestampEqualToNow() {
+        var ex = assertThrows(UserErrorException.class, () -> SendCommand.parseMessageTimestamp(1000L, 1000L));
+        assertTrue(ex.getMessage().contains("past"));
+    }
+
+    @Test
+    void parseMessageTimestampAcceptsTimestampJustBeforeNow() throws UserErrorException {
+        assertEquals(Optional.of(999L), SendCommand.parseMessageTimestamp(999L, 1000L));
+    }
+
+    @Test
+    void parseMessageTimestampRejectsFutureTimestamp() {
+        var ex = assertThrows(UserErrorException.class, () -> SendCommand.parseMessageTimestamp(1001L, 1000L));
+        assertTrue(ex.getMessage().contains("past"));
+    }
+
+    @Test
+    void parseMessageTimestampReturnsEmptyForNull() throws UserErrorException {
+        assertEquals(Optional.empty(), SendCommand.parseMessageTimestamp(null, 1000L));
+    }
+
+    @Test
+    void parseMessageTimestampRejectsZero() {
+        var ex = assertThrows(UserErrorException.class, () -> SendCommand.parseMessageTimestamp(0L, 1000L));
+        assertTrue(ex.getMessage().contains("positive"));
+    }
+
+    @Test
+    void parseMessageTimestampRejectsNegative() {
+        var ex = assertThrows(UserErrorException.class, () -> SendCommand.parseMessageTimestamp(-1L, 1000L));
+        assertTrue(ex.getMessage().contains("positive"));
+    }
+
+    @Test
+    void parseMessageTimestampHandlesSmallIntegerCleanly() throws UserErrorException {
+        // Jackson produces Integer for values < 2^31
+        assertEquals(Optional.of(12345L), SendCommand.parseMessageTimestamp(12345, 1000000L));
+    }
+
+    @Test
+    void parseMessageTimestampRejectsOutOfRangeBigInteger() {
+        // 2^64 + 1: far outside the range of a long, and outside the range
+        // Number.longValue() would silently truncate into.
+        var outOfRange = BigInteger.valueOf(2).pow(64).add(BigInteger.ONE);
+        var ex = assertThrows(UserErrorException.class,
+                () -> SendCommand.parseMessageTimestamp(outOfRange, 1000000L));
+        assertTrue(ex.getMessage().contains("integer"));
+    }
+
+    @Test
+    void parseMessageTimestampRejectsDouble() {
+        var ex = assertThrows(UserErrorException.class,
+                () -> SendCommand.parseMessageTimestamp(1.7548e12, 1000000L));
+        assertTrue(ex.getMessage().contains("integer"));
+    }
+
+    @Test
+    void parseMessageTimestampRejectsString() {
+        var ex = assertThrows(UserErrorException.class, () -> SendCommand.parseMessageTimestamp("12345", 1000000L));
+        assertTrue(ex.getMessage().contains("integer"));
+    }
+
+    // --- handleCommand: wiring tests (supplied/omitted timestamp, mutual exclusion) ---
+
     // --- Test 1: Supplied timestamp is used verbatim and echoed ---
 
     @Test
@@ -102,167 +178,6 @@ class SendTimestampTest {
         new SendCommand().handleCommand(ns, manager, nullWriter());
 
         assertEquals(Optional.empty(), captured.get().timestamp());
-    }
-
-    // --- Test 3: Zero timestamp is rejected ---
-
-    @Test
-    void zeroTimestampIsRejected() {
-        var captured = new AtomicReference<Message>();
-        var manager = capturingManager(captured);
-
-        var ns = jsonRpcNamespace(Map.of(
-                "recipient", "+11234567890",
-                "message", "hello",
-                "timestamp", 0L
-        ));
-
-        var ex = assertThrows(UserErrorException.class,
-                () -> new SendCommand().handleCommand(ns, manager, nullWriter()));
-        assertTrue(ex.getMessage().contains("positive"));
-    }
-
-    // --- Test 3b: Negative timestamp is rejected ---
-
-    @Test
-    void negativeTimestampIsRejected() {
-        var captured = new AtomicReference<Message>();
-        var manager = capturingManager(captured);
-
-        var ns = jsonRpcNamespace(Map.of(
-                "recipient", "+11234567890",
-                "message", "hello",
-                "timestamp", -1L
-        ));
-
-        var ex = assertThrows(UserErrorException.class,
-                () -> new SendCommand().handleCommand(ns, manager, nullWriter()));
-        assertTrue(ex.getMessage().contains("positive"));
-    }
-
-    // --- Test 4: Future timestamp is rejected ---
-
-    @Test
-    void futureTimestampIsRejected() {
-        var captured = new AtomicReference<Message>();
-        var manager = capturingManager(captured);
-
-        var ns = jsonRpcNamespace(Map.of(
-                "recipient", "+11234567890",
-                "message", "hello",
-                "timestamp", System.currentTimeMillis() + 60_000
-        ));
-
-        var ex = assertThrows(UserErrorException.class,
-                () -> new SendCommand().handleCommand(ns, manager, nullWriter()));
-        assertTrue(ex.getMessage().contains("past"));
-    }
-
-    // --- Test 4b: Timestamp equal to "now" is rejected (closes the one-millisecond collision hole) ---
-
-    @Test
-    void currentTimestampIsRejected() throws CommandException {
-        var captured = new AtomicReference<Message>();
-        var manager = capturingManager(captured);
-
-        // System.currentTimeMillis() is sampled here and re-sampled inside
-        // handleCommand a moment later, so on rare occasions the clock ticks
-        // over between the two reads and the sampled value ends up strictly
-        // in the past by the time it's validated (which is legitimately
-        // accepted, not the case under test). Retry with a fresh sample until
-        // we actually observe the ts == now boundary being rejected.
-        UserErrorException ex = null;
-        for (var attempt = 0; attempt < 100 && ex == null; attempt++) {
-            var ns = jsonRpcNamespace(Map.of(
-                    "recipient", "+11234567890",
-                    "message", "hello",
-                    "timestamp", System.currentTimeMillis()
-            ));
-            try {
-                new SendCommand().handleCommand(ns, manager, nullWriter());
-                // Accepted: the clock advanced past the sampled value before
-                // validation ran. Not the boundary case, retry.
-            } catch (UserErrorException e) {
-                ex = e;
-            }
-        }
-        assertTrue(ex != null, "Expected a timestamp equal to \"now\" to be rejected at least once");
-        assertTrue(ex.getMessage().contains("past"));
-    }
-
-    // --- Test 8: Small integer over JSON-RPC yields clean handling, not ClassCastException ---
-
-    @Test
-    void smallIntegerTimestampIsHandledCleanly() throws CommandException {
-        var captured = new AtomicReference<Message>();
-        var manager = capturingManager(captured);
-
-        // Jackson produces Integer for values < 2^31
-        var ns = jsonRpcNamespace(Map.of(
-                "recipient", "+11234567890",
-                "message", "hello",
-                "timestamp", 12345
-        ));
-
-        new SendCommand().handleCommand(ns, manager, nullWriter());
-        assertEquals(Optional.of(12345L), captured.get().timestamp());
-    }
-
-    // --- Test 8b: BigInteger timestamp out of long range is rejected cleanly ---
-
-    @Test
-    void outOfRangeBigIntegerTimestampIsRejected() {
-        var captured = new AtomicReference<Message>();
-        var manager = capturingManager(captured);
-
-        // 2^64 + 1: far outside the range of a long, and outside the range
-        // Number.longValue() would silently truncate into.
-        var outOfRange = BigInteger.valueOf(2).pow(64).add(BigInteger.ONE);
-        var ns = jsonRpcNamespace(Map.of(
-                "recipient", "+11234567890",
-                "message", "hello",
-                "timestamp", outOfRange
-        ));
-
-        var ex = assertThrows(UserErrorException.class,
-                () -> new SendCommand().handleCommand(ns, manager, nullWriter()));
-        assertTrue(ex.getMessage().contains("integer"));
-    }
-
-    // --- Test 8c: Double timestamp is rejected cleanly, not silently truncated ---
-
-    @Test
-    void doubleTimestampIsRejected() {
-        var captured = new AtomicReference<Message>();
-        var manager = capturingManager(captured);
-
-        var ns = jsonRpcNamespace(Map.of(
-                "recipient", "+11234567890",
-                "message", "hello",
-                "timestamp", 1.7548e12
-        ));
-
-        var ex = assertThrows(UserErrorException.class,
-                () -> new SendCommand().handleCommand(ns, manager, nullWriter()));
-        assertTrue(ex.getMessage().contains("integer"));
-    }
-
-    // --- Test 8d: String timestamp is rejected cleanly, not a ClassCastException ---
-
-    @Test
-    void stringTimestampIsRejected() {
-        var captured = new AtomicReference<Message>();
-        var manager = capturingManager(captured);
-
-        var ns = jsonRpcNamespace(Map.of(
-                "recipient", "+11234567890",
-                "message", "hello",
-                "timestamp", "12345"
-        ));
-
-        var ex = assertThrows(UserErrorException.class,
-                () -> new SendCommand().handleCommand(ns, manager, nullWriter()));
-        assertTrue(ex.getMessage().contains("integer"));
     }
 
     // --- Test 9: --timestamp combined with --edit-timestamp is rejected ---

@@ -113,7 +113,7 @@ public class SendCommand implements JsonRpcLocalCommand {
                 .type(long.class)
                 .help("Specify the message timestamp (its Signal message id). "
                         + "Reusing the timestamp of a previous send makes the message a duplicate that recipients discard. "
-                        + "Must be in the past. "
+                        + "Must be a positive number in the past. "
                         + "Cannot be combined with --edit-timestamp or --end-session. "
                         + "Defaults to the current time.");
         subparser.addArgument("--voice-note")
@@ -140,23 +140,11 @@ public class SendCommand implements JsonRpcLocalCommand {
                 groupIdStrings,
                 usernameStrings);
 
-        final Optional<Long> messageTimestamp;
-        final var rawTimestamp = ns.get("timestamp");
-        if (rawTimestamp != null) {
-            final long ts = switch (rawTimestamp) {
-                case Integer i -> i.longValue();
-                case Long l -> l;
-                default -> throw new UserErrorException("Timestamp must be an integer number of milliseconds");
-            };
-            if (ts <= 0) {
-                throw new UserErrorException("Timestamp must be positive");
-            }
-            if (ts >= System.currentTimeMillis()) {
-                throw new UserErrorException("Timestamp must be in the past");
-            }
-            messageTimestamp = Optional.of(ts);
-        } else {
-            messageTimestamp = Optional.empty();
+        final var messageTimestamp = parseMessageTimestamp(ns.get("timestamp"), System.currentTimeMillis());
+
+        final var editTimestamp = ns.getLong("edit-timestamp");
+        if (editTimestamp != null && messageTimestamp.isPresent()) {
+            throw new UserErrorException("--timestamp cannot be combined with --edit-timestamp");
         }
 
         final var isEndSession = Boolean.TRUE.equals(ns.getBoolean("end-session"));
@@ -274,12 +262,6 @@ public class SendCommand implements JsonRpcLocalCommand {
                     "Sending empty message is not allowed, either a message, attachment or sticker must be given.");
         }
 
-        final var editTimestamp = ns.getLong("edit-timestamp");
-
-        if (editTimestamp != null && messageTimestamp.isPresent()) {
-            throw new UserErrorException("--timestamp cannot be combined with --edit-timestamp");
-        }
-
         try {
             final var message = new Message(messageText,
                     attachments,
@@ -298,7 +280,9 @@ public class SendCommand implements JsonRpcLocalCommand {
                     : m.sendMessage(message, recipientIdentifiers, notifySelf);
             outputResult(outputWriter, results);
         } catch (UnsupportedOperationException e) {
-            throw new UserErrorException(e.getMessage());
+            throw new UserErrorException(e.getMessage() == null
+                    ? "Command is not yet implemented via dbus"
+                    : e.getMessage(), e);
         } catch (AttachmentInvalidException | IOException e) {
             if (e instanceof IOException io && io.getMessage().contains("No prekeys available")) {
                 throw new UnexpectedErrorException("Failed to send message: " + e.getMessage() + " (" + e.getClass()
@@ -315,6 +299,24 @@ public class SendCommand implements JsonRpcLocalCommand {
         } catch (InvalidStickerException e) {
             throw new UserErrorException("Failed to send sticker: " + e.getMessage(), e);
         }
+    }
+
+    static Optional<Long> parseMessageTimestamp(final Object raw, final long now) throws UserErrorException {
+        if (raw == null) {
+            return Optional.empty();
+        }
+        final long ts = switch (raw) {
+            case Integer i -> i.longValue();
+            case Long l -> l;
+            default -> throw new UserErrorException("Timestamp must be an integer number of milliseconds");
+        };
+        if (ts <= 0) {
+            throw new UserErrorException("Timestamp must be positive");
+        }
+        if (ts >= now) {
+            throw new UserErrorException("Timestamp must be in the past");
+        }
+        return Optional.of(ts);
     }
 
     private List<Message.Mention> parseMentions(
