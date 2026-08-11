@@ -414,7 +414,8 @@ Specify the timestamp of a previous message with the recipient or group to send 
 Specify the message timestamp (its Signal message id).
 Reusing the timestamp of a previous send makes the message a duplicate that recipients discard.
 This allows idempotent retries: if a send times out, the caller can retry with the same timestamp and recipients will deduplicate.
-Must be a positive number not in the future.
+Must be a positive number in the past.
+Cannot be combined with *--edit-timestamp* or *--end-session*.
 Defaults to the current time.
 
 *--no-urgent*::
