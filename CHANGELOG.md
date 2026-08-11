@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.14.7-leakfix6] - 2026-08-11
+
+Fork release based on upstream 0.14.7.
+
+### Added
+
+- Add `--timestamp` option to `send` command, to specify the message timestamp for idempotent retries
+
+### Carried in this fork (not yet upstream)
+
+- Cache CertificateValidator instead of creating one per message decrypt
+- Abort group send on StackOverflowError and log the recursion
+- Log the recursion cycle on any StackOverflowError, globally
+- Log a DECRYPT-FAIL diagnostic on first-contact decrypt failures
+
 ## [0.14.7] - 2026-08-01
 
 ### Added
