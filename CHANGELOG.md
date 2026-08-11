@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add `--timestamp` option to `send` command, to specify the message timestamp for idempotent retries
+
 ## [0.14.7] - 2026-08-01
 
 ### Added
