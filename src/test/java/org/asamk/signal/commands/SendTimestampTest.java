@@ -217,4 +217,34 @@ class SendTimestampTest {
                 () -> new SendCommand().handleCommand(ns, manager, nullWriter()));
         assertTrue(ex.getMessage().contains("--end-session"));
     }
+
+    // --- Wiring check: handleCommand must sample the real clock, not a fixed/disabled bound ---
+
+    /**
+     * Pins the {@code System.currentTimeMillis()} wiring at the
+     * {@link SendCommand#parseMessageTimestamp(Object, long)} call site in
+     * {@code handleCommand}. Unlike the deterministic
+     * {@code parseMessageTimestampRejectsFutureTimestamp} test above, this
+     * goes through {@code handleCommand} itself: if the {@code now} argument
+     * there were ever replaced with a constant like {@code Long.MAX_VALUE},
+     * every other test in this class would still pass, but this one would
+     * fail because a timestamp one day in the future would incorrectly be
+     * accepted as "in the past".
+     */
+    @Test
+    void handleCommandRejectsFutureTimestampUsingSystemClock() {
+        var captured = new AtomicReference<Message>();
+        var manager = capturingManager(captured);
+        long futureTs = System.currentTimeMillis() + 86_400_000L;
+
+        var ns = jsonRpcNamespace(Map.of(
+                "recipient", "+11234567890",
+                "message", "hello",
+                "timestamp", futureTs
+        ));
+
+        var ex = assertThrows(UserErrorException.class,
+                () -> new SendCommand().handleCommand(ns, manager, nullWriter()));
+        assertTrue(ex.getMessage().contains("past"));
+    }
 }

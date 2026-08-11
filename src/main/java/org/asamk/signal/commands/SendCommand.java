@@ -279,10 +279,6 @@ public class SendCommand implements JsonRpcLocalCommand {
                     ? m.sendEditMessage(message, recipientIdentifiers, editTimestamp)
                     : m.sendMessage(message, recipientIdentifiers, notifySelf);
             outputResult(outputWriter, results);
-        } catch (UnsupportedOperationException e) {
-            throw new UserErrorException(e.getMessage() == null
-                    ? "Command is not yet implemented via dbus"
-                    : e.getMessage(), e);
         } catch (AttachmentInvalidException | IOException e) {
             if (e instanceof IOException io && io.getMessage().contains("No prekeys available")) {
                 throw new UnexpectedErrorException("Failed to send message: " + e.getMessage() + " (" + e.getClass()
