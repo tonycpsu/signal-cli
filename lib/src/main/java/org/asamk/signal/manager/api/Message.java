@@ -14,7 +14,8 @@ public record Message(
         List<Preview> previews,
         Optional<StoryReply> storyReply,
         List<TextStyle> textStyles,
-        boolean urgent
+        boolean urgent,
+        Optional<Long> timestamp
 ) {
 
     public record Mention(RecipientIdentifier.Single recipient, int start, int length) {}

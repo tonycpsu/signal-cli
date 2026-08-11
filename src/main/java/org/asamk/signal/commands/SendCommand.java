@@ -257,7 +257,8 @@ public class SendCommand implements JsonRpcLocalCommand {
                     previews,
                     Optional.ofNullable((storyReply)),
                     textStyles,
-                    !noUrgent);
+                    !noUrgent,
+                    Optional.empty());
             var results = editTimestamp != null
                     ? m.sendEditMessage(message, recipientIdentifiers, editTimestamp)
                     : m.sendMessage(message, recipientIdentifiers, notifySelf);
