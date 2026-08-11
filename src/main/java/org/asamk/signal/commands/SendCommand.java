@@ -109,6 +109,11 @@ public class SendCommand implements JsonRpcLocalCommand {
                 .action(Arguments.storeTrue())
                 .help("Send the message without the urgent flag, so no push notification is triggered for the recipient. "
                         + "The message will still be delivered in real-time if the recipient's app is active.");
+        subparser.addArgument("--timestamp")
+                .type(long.class)
+                .help("Specify the message timestamp (its Signal message id). "
+                        + "Reusing the timestamp of a previous send makes the message a duplicate that recipients discard. "
+                        + "Defaults to the current time.");
         subparser.addArgument("--voice-note")
                 .action(Arguments.storeTrue())
                 .help("Mark audio attachments as voice notes. Voice notes are displayed inline in Signal clients.");
@@ -246,6 +251,21 @@ public class SendCommand implements JsonRpcLocalCommand {
 
         final var editTimestamp = ns.getLong("edit-timestamp");
 
+        final Optional<Long> messageTimestamp;
+        final var rawTimestamp = ns.<Number>get("timestamp");
+        if (rawTimestamp != null) {
+            final long ts = rawTimestamp.longValue();
+            if (ts <= 0) {
+                throw new UserErrorException("Timestamp must be positive");
+            }
+            if (ts > System.currentTimeMillis()) {
+                throw new UserErrorException("Timestamp must not be in the future");
+            }
+            messageTimestamp = Optional.of(ts);
+        } else {
+            messageTimestamp = Optional.empty();
+        }
+
         try {
             final var message = new Message(messageText,
                     attachments,
@@ -258,7 +278,7 @@ public class SendCommand implements JsonRpcLocalCommand {
                     Optional.ofNullable((storyReply)),
                     textStyles,
                     !noUrgent,
-                    Optional.empty());
+                    messageTimestamp);
             var results = editTimestamp != null
                     ? m.sendEditMessage(message, recipientIdentifiers, editTimestamp)
                     : m.sendMessage(message, recipientIdentifiers, notifySelf);
