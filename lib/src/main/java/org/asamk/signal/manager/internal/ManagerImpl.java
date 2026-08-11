@@ -151,6 +151,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -672,6 +673,15 @@ public class ManagerImpl implements Manager {
         return context.getGroupHelper().joinGroup(inviteLinkUrl);
     }
 
+    /**
+     * Selects the timestamp to use for an outgoing message: the caller-supplied
+     * timestamp if present, otherwise a freshly minted one from {@code minter}.
+     * The minter is only invoked when {@code supplied} is empty.
+     */
+    static long selectMessageTimestamp(Optional<Long> supplied, LongSupplier minter) {
+        return supplied.orElseGet(minter::getAsLong);
+    }
+
     private long getNextMessageTimestamp() {
         while (true) {
             final var last = lastMessageTimestamp.get();
@@ -707,7 +717,7 @@ public class ManagerImpl implements Manager {
             boolean urgent
     ) throws IOException, NotAGroupMemberException, GroupNotFoundException, GroupSendingNotAllowedException {
         var results = new HashMap<RecipientIdentifier, List<SendMessageResult>>();
-        long timestamp = messageTimestamp.orElseGet(this::getNextMessageTimestamp);
+        long timestamp = selectMessageTimestamp(messageTimestamp, this::getNextMessageTimestamp);
         messageBuilder.withTimestamp(timestamp);
         for (final var recipient : recipients) {
             if (recipient instanceof RecipientIdentifier.NoteToSelf || (
