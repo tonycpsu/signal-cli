@@ -47,6 +47,7 @@ import org.signal.libsignal.metadata.ProtocolUntrustedIdentityException;
 import org.signal.libsignal.metadata.SelfSendException;
 import org.signal.libsignal.protocol.InvalidMessageException;
 import org.signal.libsignal.protocol.groups.GroupSessionBuilder;
+import org.signal.libsignal.protocol.message.CiphertextMessage;
 import org.signal.libsignal.protocol.message.DecryptionErrorMessage;
 import org.signal.libsignal.protocol.message.PreKeySignalMessage;
 import org.signal.libsignal.zkgroup.InvalidInputException;
@@ -182,11 +183,16 @@ public final class IncomingMessageHandler {
             } catch (ProtocolInvalidKeyIdException | ProtocolInvalidKeyException | ProtocolNoSessionException |
                      ProtocolInvalidMessageException e) {
                 logger.debug("Failed to decrypt incoming message", e);
-                logDecryptFailureDiagnostic(envelope, e);
+                // Resolved once here and shared with the diagnostic below.
+                // resolveRecipient is a get-or-create that opens an IMMEDIATE write
+                // transaction on a cache miss, and a freshly inserted row is not cached,
+                // so resolving separately inside the diagnostic would double the write
+                // transactions in exactly the first-contact burst it exists to study.
+                final var sender = account.getRecipientResolver().resolveRecipient(e.getSender());
+                logDecryptFailureDiagnostic(envelope, e, sender);
                 if (e instanceof ProtocolInvalidKeyIdException) {
                     actions.add(RefreshPreKeysAction.create());
                 }
-                final var sender = account.getRecipientResolver().resolveRecipient(e.getSender());
                 if (context.getContactHelper().isContactBlocked(sender)) {
                     logger.debug("Received invalid message from blocked contact, ignoring.");
                 } else {
@@ -224,10 +230,37 @@ public final class IncomingMessageHandler {
         return new Pair<>(actions, exception);
     }
 
-    // Diagnostic: greppable, structured capture on any decrypt failure — to pin the
-    // first-contact / burst PreKey "decryption failed" (MAC) signature. Observational only;
-    // never throws. Grep prod logs for "SIGNAL-CLI DECRYPT-FAIL".
-    private void logDecryptFailureDiagnostic(final SignalServiceEnvelope envelope, final ProtocolException e) {
+    // Diagnostic: greppable, structured capture on any decrypt failure. Observational
+    // only; never throws. Grep logs for "SIGNAL-CLI DECRYPT-FAIL".
+    //
+    // Sealed-sender blind spot this works around: envelope.isPreKeySignalMessage()
+    // reads the OUTER envelope type, which for a sealed-sender message is always
+    // UNIDENTIFIED_SENDER. It therefore reports false for every sealed message no
+    // matter what is inside, and the inner prekey IDs never appear. Since sealed
+    // sender is now the common case, that blind spot covered nearly all traffic:
+    // a month of captured failures showed prekeyMsg=false and preKey=[n/a] on every
+    // single line, which reads as "no PreKey failures happen" when it actually means
+    // "this probe cannot see them".
+    //
+    // The exception carries the ALREADY-UNWRAPPED UnidentifiedSenderMessageContent,
+    // so innerType/preKey below describe the message that really failed, with no
+    // second decryption attempt. innerType is the field to trust; prekeyMsg is kept
+    // only so old and new lines stay comparable.
+    //
+    // The catch is on Throwable, not Exception, and that is load-bearing rather than
+    // defensive habit. Several calls below surface an Error, not an Exception:
+    // GroupId.unknownVersion throws AssertionError unless the id is exactly 16 or 32
+    // bytes, and that array is an opaque protobuf field chosen by the REMOTE SENDER;
+    // libsignal's FilterExceptions turns an unexpected native failure into an
+    // AssertionError too. An Error escaping here is not a lost log line — the receive
+    // loop catches only Exception, the daemon thread lambda catches nothing, and its
+    // `receiveThread = null` reset sits after the call and so never runs, leaving
+    // startReceiveThreadIfRequired convinced the thread is still alive. The account
+    // would stop receiving until the process restarted, on a message any sender could
+    // craft. A diagnostic must never be able to do that.
+    private void logDecryptFailureDiagnostic(
+            final SignalServiceEnvelope envelope, final ProtocolException e, final RecipientId senderId
+    ) {
         if (!logger.isWarnEnabled()) {
             return;
         }
@@ -244,10 +277,31 @@ public final class IncomingMessageHandler {
                     : destination.equals(aci) ? "ACI"
                     : destination.equals(pni) ? "PNI" : "other";
 
+            // Inner view: prefer the unwrapped sealed-sender content, fall back to the
+            // envelope's own type for a plain (non-sealed) message. The inner ciphertext
+            // is fetched ONLY for a PreKey message — getContent() marshals the whole
+            // payload across JNI and every other type would discard it unread.
+            final String innerType;
+            byte[] innerContent = null;
+            final var usmc = e.getUnidentifiedSenderMessageContent();
+            if (usmc.isPresent()) {
+                final int type = usmc.get().getType();
+                innerType = ciphertextTypeName(type);
+                if (type == CiphertextMessage.PREKEY_TYPE) {
+                    innerContent = usmc.get().getContent();
+                }
+            } else {
+                innerType = envelopeTypeName(envelope.getType());
+                if (envelope.isPreKeySignalMessage() && envelope.hasContent()) {
+                    // getContent() is null-safe; the raw proto content field is not.
+                    innerContent = envelope.getContent();
+                }
+            }
+
             String preKey = "n/a";
-            if (envelope.isPreKeySignalMessage()) {
+            if (innerContent != null) {
                 try {
-                    final var pkm = new PreKeySignalMessage(envelope.getProto().content.toByteArray());
+                    final var pkm = new PreKeySignalMessage(innerContent);
                     preKey = "regId=" + pkm.getRegistrationId()
                             + ",signedPreKeyId=" + pkm.getSignedPreKeyId()
                             + ",preKeyId=" + pkm.getPreKeyId().map(String::valueOf).orElse("none");
@@ -256,23 +310,101 @@ public final class IncomingMessageHandler {
                 }
             }
 
+            // The sender is the caller's already-resolved RecipientId — an internal
+            // numeric id, not a raw service id — which joins against the sibling
+            // "Sending retry receipt ... to RecipientId[id=N]" and "Marking
+            // RecipientId[id=N] ..." lines. Note this is a reduction in exposure, not
+            // an absence of it: groupId below is a stable group identifier, and
+            // exc={message} can carry ids libsignal chose to put in its text. These
+            // lines are shipped off-box, so treat the whole line as identifying.
+            final String sender = senderId == null ? "unknown" : String.valueOf(senderId.id());
+
+            String senderTrust = "unknown";
+            final var senderServiceId = ServiceId.parseOrNull(e.getSender());
+            if (senderServiceId != null) {
+                try {
+                    // An untrusted identity is why a retry receipt / RenewSessionAction
+                    // cannot be delivered, so the failure repeats indefinitely instead of
+                    // self-healing. Capturing it makes that diagnosable from one line.
+                    // A read-only lookup: isTrustedIdentity would WRITE, this must not.
+                    final var identity = account.getIdentityKeyStore().getIdentityInfo(senderServiceId);
+                    // "none" also covers a stored key that failed to parse — the store
+                    // returns null for both, and they are not distinguishable here.
+                    senderTrust = identity == null ? "none" : String.valueOf(identity.getTrustLevel());
+                } catch (Exception ignored) {
+                    // keep "unknown"
+                }
+            }
+
+            // GroupId.unknownVersion throws AssertionError on any length but 16 or 32,
+            // and these bytes are chosen by the remote sender — so check before calling
+            // rather than relying on the catch below.
+            final String groupId = e.getGroupId()
+                    .map(id -> id.length == 16 || id.length == 32
+                            ? GroupId.unknownVersion(id).toBase64()
+                            : "invalid-length-" + id.length)
+                    .orElse("n/a");
+
             final long ts = envelope.getTimestamp();
             final long deliveredTs = envelope.getServerDeliveredTimestamp();
-            logger.warn("SIGNAL-CLI DECRYPT-FAIL dest={} sealed={} prekeyMsg={} exc={}:{} senderDevice={} "
+            logger.warn("SIGNAL-CLI DECRYPT-FAIL dest={} sealed={} prekeyMsg={} innerType={} exc={}:{} "
+                            + "sender={} senderTrust={} senderDevice={} groupId={} contentHint={} "
                             + "msgTs={} deliveredTs={} lagMs={} preKey=[{}]",
                     destType,
                     envelope.isUnidentifiedSender(),
                     envelope.isPreKeySignalMessage(),
+                    innerType,
                     e.getClass().getSimpleName(),
                     e.getMessage(),
+                    sender,
+                    senderTrust,
                     e.getSenderDevice(),
+                    groupId,
+                    e.getContentHint(),
                     ts,
                     deliveredTs,
                     deliveredTs - ts,
                     preKey);
-        } catch (Exception diagEx) {
+        } catch (Throwable diagEx) {
+            // Throwable, not Exception — see the note on this method. Swallowing an
+            // Error here costs one log line; letting it out costs the receive thread.
             logger.debug("DECRYPT-FAIL diagnostic itself failed", diagEx);
         }
+    }
+
+    private static String ciphertextTypeName(final int type) {
+        return switch (type) {
+            case CiphertextMessage.WHISPER_TYPE -> "WHISPER";
+            case CiphertextMessage.PREKEY_TYPE -> "PREKEY";
+            case CiphertextMessage.SENDERKEY_TYPE -> "SENDERKEY";
+            case CiphertextMessage.PLAINTEXT_CONTENT_TYPE -> "PLAINTEXT";
+            default -> "type" + type;
+        };
+    }
+
+    // Normalised into the SAME vocabulary as ciphertextTypeName, so one query matches a
+    // given inner type whether or not the message was sealed. The envelope enum's own
+    // names would not: "PREKEY_MESSAGE" has "PREKEY" as a strict prefix, so a loose
+    // query silently over-matches and an exact one silently under-matches — the same
+    // shape of miscount this change exists to remove.
+    private static String envelopeTypeName(final Integer envelopeType) {
+        if (envelopeType == null) {
+            return "unknown";
+        }
+        final var type = Envelope.Type.fromValue(envelopeType);
+        if (type == null) {
+            return "type" + envelopeType;
+        }
+        return switch (type) {
+            case PREKEY_MESSAGE -> ciphertextTypeName(CiphertextMessage.PREKEY_TYPE);
+            case PLAINTEXT_CONTENT -> ciphertextTypeName(CiphertextMessage.PLAINTEXT_CONTENT_TYPE);
+            // A sealed envelope whose unwrapped content the exception did not carry.
+            // Named distinctly rather than folded into SENDERKEY the way the
+            // retry-receipt path does, because here it means "inner type unavailable",
+            // which is a different claim from "the inner message was a sender-key one".
+            case UNIDENTIFIED_SENDER -> "SEALED_NO_CONTENT";
+            default -> ciphertextTypeName(CiphertextMessage.WHISPER_TYPE);
+        };
     }
 
     private SignalServiceContent validate(
