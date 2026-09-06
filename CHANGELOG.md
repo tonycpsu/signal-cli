@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.14.7-fork7] - 2026-09-06
+
+Fork release based on upstream 0.14.7.
+
+Fork releases were previously tagged `leakfix<N>`. That name described only the
+first one, which fixed a native-library temp-directory leak; every release since
+has carried unrelated diagnostics, crash guards and small API additions. The
+series is renamed to `fork<N>` from here on, continuing the count, so the name no
+longer claims something the build does not do. Earlier tags are left as published.
+
+### Changed
+
+- Decrypt-failure diagnostics now report the message that actually failed. The
+  previous line read the outer envelope type, which is always `UNIDENTIFIED_SENDER`
+  for a sealed-sender message, so it logged `prekeyMsg=false` and `preKey=[n/a]`
+  regardless of the inner message. The unwrapped `UnidentifiedSenderMessageContent`
+  carried on the exception is now used instead, adding `innerType`
+  (`PREKEY`/`WHISPER`/`SENDERKEY`/`PLAINTEXT`) and populating the prekey ids for
+  sealed messages. No additional decryption is performed. Sealed and unsealed
+  failures report `innerType` in one shared vocabulary, so a single query matches
+  both.
+- The diagnostic is now guarded against `Error`, not just `Exception`. It reads
+  fields derived from remote-controlled bytes, and the receive loop above it
+  catches only `Exception`, so an `Error` escaping the diagnostic would have
+  stopped the receive thread for the lifetime of the process.
+- The same line now also reports `sender` (as the internal recipient id),
+  `senderTrust` (the stored identity trust level), `groupId` and `contentHint`.
+  `senderTrust` distinguishes a transient decrypt failure from one that cannot
+  self-heal, because a retry receipt and session renewal cannot be delivered to an
+  untrusted identity.
+
 ## [0.14.7-leakfix6] - 2026-08-11
 
 Fork release based on upstream 0.14.7.
