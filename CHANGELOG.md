@@ -1,10 +1,22 @@
 # Changelog
 
-## [Unreleased]
+## [0.14.9-fork8] - 2026-10-24
+
+Fork release based on upstream 0.14.9. It carries the same patches as
+0.14.7-fork7, rebased onto 0.14.9. The send timestamp patch is now the version
+proposed upstream.
 
 ### Added
 
 - `send --timestamp` to set the timestamp of the sent message instead of using the current time
+
+### Carried in this fork (not yet upstream)
+
+- Cache CertificateValidator instead of creating one per message decrypt
+- Abort group send on StackOverflowError and log the recursion
+- Log the recursion cycle on any StackOverflowError, globally
+- Log a DECRYPT-FAIL diagnostic on first-contact decrypt failures
+- Report the message that actually failed to decrypt (inner message type, prekey ids, sender trust)
 
 ## [0.14.9] - 2026-10-07
 
