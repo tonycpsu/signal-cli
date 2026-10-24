@@ -38,6 +38,7 @@ import org.asamk.signal.manager.storage.stickers.StickerPack;
 import org.asamk.signal.manager.util.MimeUtils;
 import org.signal.core.models.ServiceId;
 import org.signal.core.models.ServiceId.ACI;
+import org.signal.libsignal.metadata.ProtocolException;
 import org.signal.libsignal.metadata.ProtocolInvalidKeyException;
 import org.signal.libsignal.metadata.ProtocolInvalidKeyIdException;
 import org.signal.libsignal.metadata.ProtocolInvalidMessageException;
@@ -47,6 +48,7 @@ import org.signal.libsignal.metadata.SelfSendException;
 import org.signal.libsignal.protocol.InvalidMessageException;
 import org.signal.libsignal.protocol.groups.GroupSessionBuilder;
 import org.signal.libsignal.protocol.message.DecryptionErrorMessage;
+import org.signal.libsignal.protocol.message.PreKeySignalMessage;
 import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.signal.libsignal.zkgroup.profiles.ProfileKey;
 import org.slf4j.Logger;
@@ -180,6 +182,7 @@ public final class IncomingMessageHandler {
             } catch (ProtocolInvalidKeyIdException | ProtocolInvalidKeyException | ProtocolNoSessionException |
                      ProtocolInvalidMessageException e) {
                 logger.debug("Failed to decrypt incoming message", e);
+                logDecryptFailureDiagnostic(envelope, e);
                 if (e instanceof ProtocolInvalidKeyIdException) {
                     actions.add(RefreshPreKeysAction.create());
                 }
@@ -219,6 +222,57 @@ public final class IncomingMessageHandler {
 
         actions.addAll(checkAndHandleMessage(envelope, content, receiveConfig, handler, exception));
         return new Pair<>(actions, exception);
+    }
+
+    // Diagnostic: greppable, structured capture on any decrypt failure — to pin the
+    // first-contact / burst PreKey "decryption failed" (MAC) signature. Observational only;
+    // never throws. Grep prod logs for "SIGNAL-CLI DECRYPT-FAIL".
+    private void logDecryptFailureDiagnostic(final SignalServiceEnvelope envelope, final ProtocolException e) {
+        if (!logger.isWarnEnabled()) {
+            return;
+        }
+        try {
+            final var aci = account.getAci();
+            final var pni = account.getPni();
+            Object destination;
+            try {
+                destination = getDestination(envelope).serviceId();
+            } catch (Exception ignored) {
+                destination = null;
+            }
+            final String destType = destination == null ? "unknown"
+                    : destination.equals(aci) ? "ACI"
+                    : destination.equals(pni) ? "PNI" : "other";
+
+            String preKey = "n/a";
+            if (envelope.isPreKeySignalMessage()) {
+                try {
+                    final var pkm = new PreKeySignalMessage(envelope.getProto().content.toByteArray());
+                    preKey = "regId=" + pkm.getRegistrationId()
+                            + ",signedPreKeyId=" + pkm.getSignedPreKeyId()
+                            + ",preKeyId=" + pkm.getPreKeyId().map(String::valueOf).orElse("none");
+                } catch (Exception parseEx) {
+                    preKey = "parse-failed(" + parseEx.getClass().getSimpleName() + ")";
+                }
+            }
+
+            final long ts = envelope.getTimestamp();
+            final long deliveredTs = envelope.getServerDeliveredTimestamp();
+            logger.warn("SIGNAL-CLI DECRYPT-FAIL dest={} sealed={} prekeyMsg={} exc={}:{} senderDevice={} "
+                            + "msgTs={} deliveredTs={} lagMs={} preKey=[{}]",
+                    destType,
+                    envelope.isUnidentifiedSender(),
+                    envelope.isPreKeySignalMessage(),
+                    e.getClass().getSimpleName(),
+                    e.getMessage(),
+                    e.getSenderDevice(),
+                    ts,
+                    deliveredTs,
+                    deliveredTs - ts,
+                    preKey);
+        } catch (Exception diagEx) {
+            logger.debug("DECRYPT-FAIL diagnostic itself failed", diagEx);
+        }
     }
 
     private SignalServiceContent validate(
